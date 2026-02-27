@@ -1,0 +1,31 @@
+# Crawl state files
+visited.txt
+queue.txt
+*_links.txt
+all_to_visit.txt
+
+# Logs
+*.log
+error_log.txt
+
+# Downloaded files
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.env
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
