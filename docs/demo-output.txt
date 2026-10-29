@@ -1,0 +1,14 @@
+> python scraper.py https://www.orimi.com/pdf-test.pdf -w 1 -o downloads/demo --visited-file downloads/demo/visited.txt --queue-file downloads/demo/queue.txt --log downloads/demo/scraper.log
+
+Crawling : www.orimi.com
+Output   : downloads/demo
+Workers  : 1
+Filetypes: .doc, .docx, .odt, .pdf
+Queue    : 1 | Visited: 0
+
+Queuing download : https://www.orimi.com/pdf-test.pdf
+  [+] pdf-test.pdf
+
+Summary: 1 downloaded, 0 already present, 0 failed
+
+Done. Files saved to 'downloads/demo/'

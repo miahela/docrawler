@@ -24,6 +24,7 @@ def load(filepath: str) -> set:
 
 
 def write(links: set, filepath: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("\n".join(sorted(links)))
 
@@ -37,7 +38,7 @@ def cmd_dedup(args: argparse.Namespace) -> None:
     links = load(args.file)
     output = args.output or args.file
     write(links, output)
-    print(f"{len(links):,} unique URLs → {output}")
+    print(f"{len(links):,} unique URLs -> {output}")
 
 
 def cmd_subtract(args: argparse.Namespace) -> None:
@@ -48,7 +49,7 @@ def cmd_subtract(args: argparse.Namespace) -> None:
     output = args.output or args.queue
     write(remaining, output)
     removed = len(queue) - len(remaining)
-    print(f"Removed {removed:,} visited URLs. {len(remaining):,} remaining → {output}")
+    print(f"Removed {removed:,} visited URLs. {len(remaining):,} remaining -> {output}")
 
 
 def cmd_merge(args: argparse.Namespace) -> None:
@@ -60,7 +61,7 @@ def cmd_merge(args: argparse.Namespace) -> None:
             continue
         combined.update(load(filepath))
     write(combined, args.output)
-    print(f"Merged {len(args.files)} file(s): {len(combined):,} unique URLs → {args.output}")
+    print(f"Merged {len(args.files)} file(s): {len(combined):,} unique URLs -> {args.output}")
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +95,10 @@ def main() -> None:
     p_merge.set_defaults(func=cmd_merge)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (OSError, UnicodeError) as e:
+        parser.exit(1, f"File error: {e}\n")
 
 
 if __name__ == "__main__":

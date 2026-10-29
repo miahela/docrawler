@@ -17,30 +17,25 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from config import Settings, load_settings
+
 
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_EXTENSIONS = [".pdf", ".docx", ".doc", ".odt"]
-DEFAULT_WORKERS = 5
-DEFAULT_OUTPUT_DIR = "downloads"
-DEFAULT_VISITED_FILE = "visited.txt"
-DEFAULT_QUEUE_FILE = "queue.txt"
-DEFAULT_LOG_FILE = "scraper.log"
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
+DEFAULTS = Settings()
 
 
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
 
-def build_session(retries: int = 3, backoff: float = 1.0) -> requests.Session:
+def build_session(
+    retries: int = DEFAULTS.retries,
+    backoff: float = DEFAULTS.backoff,
+    user_agent: str = DEFAULTS.user_agent,
+) -> requests.Session:
     """Create a requests session with retry logic."""
     strategy = Retry(
         total=retries,
@@ -49,7 +44,7 @@ def build_session(retries: int = 3, backoff: float = 1.0) -> requests.Session:
         allowed_methods=["HEAD", "GET", "OPTIONS"],
     )
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update({"User-Agent": user_agent})
     adapter = HTTPAdapter(max_retries=strategy)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
@@ -66,7 +61,7 @@ def get_domain(url: str) -> str:
 
 def is_valid_url(url: str) -> bool:
     parsed = urlparse(url)
-    return bool(parsed.scheme) and bool(parsed.netloc)
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
 
 
 def is_same_domain(url: str, domain: str) -> bool:
@@ -92,6 +87,7 @@ def load_links(filepath: str) -> set:
 
 def append_links(links: set, filepath: str) -> None:
     """Append URLs to a state file."""
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     with open(filepath, "a", encoding="utf-8") as f:
         for link in links:
             f.write(f"{link}\n")
@@ -101,13 +97,16 @@ def append_links(links: set, filepath: str) -> None:
 # Core crawl logic
 # ---------------------------------------------------------------------------
 
-def extract_links(session: requests.Session, url: str, domain: str) -> set:
+def extract_links(
+    session: requests.Session, url: str, domain: str,
+    timeout: float = DEFAULTS.page_timeout,
+) -> set:
     """
     Fetch a page and return all same-domain links found in anchor tags.
     Returns an empty set on any error or non-HTML response.
     """
     try:
-        response = session.get(url, timeout=15)
+        response = session.get(url, timeout=timeout)
         response.raise_for_status()
         if "html" not in response.headers.get("Content-Type", ""):
             return set()
@@ -118,27 +117,36 @@ def extract_links(session: requests.Session, url: str, domain: str) -> set:
             if is_valid_url(full_url) and is_same_domain(full_url, domain):
                 links.add(full_url)
         return links
-    except requests.RequestException as e:
+    except (requests.RequestException, ValueError) as e:
         logging.error("Failed to fetch %s: %s", url, e)
         return set()
 
 
-def download_file(session: requests.Session, url: str, output_dir: str) -> None:
-    """Download a single file to output_dir. Skips if already present."""
+def download_file(
+    session: requests.Session, url: str, output_dir: str,
+    timeout: float = DEFAULTS.download_timeout,
+) -> str:
+    """Return downloaded, skipped, or failed without leaving a partial final file."""
     try:
         filename = urlparse(url).path.split("/")[-1] or "document"
         filepath = os.path.join(output_dir, filename)
         if os.path.exists(filepath):
             logging.debug("Already exists: %s", filename)
-            return
-        response = session.get(url, timeout=30)
+            return "skipped"
+        response = session.get(url, timeout=timeout)
         response.raise_for_status()
-        with open(filepath, "wb") as f:
+        # A failed write must not become an existing file on the next run.
+        partial_path = filepath + ".part"
+        with open(partial_path, "wb") as f:
             f.write(response.content)
+        os.replace(partial_path, filepath)
         print(f"  [+] {filename}")
         logging.info("Downloaded: %s", filename)
-    except Exception as e:
+        return "downloaded"
+    except (requests.RequestException, OSError, ValueError) as e:
         logging.error("Failed to download %s: %s", url, e)
+        print(f"  [!] Download failed: {url}. See the log for details.")
+        return "failed"
 
 
 def crawl(
@@ -149,6 +157,7 @@ def crawl(
     workers: int,
     visited_file: str,
     queue_file: str,
+    settings: Settings = DEFAULTS,
 ) -> None:
     """
     Crawl `domain` starting from `start_url`, downloading any file whose
@@ -163,8 +172,9 @@ def crawl(
     # First run — seed the queue with the start URL
     if not queue:
         queue.add(start_url)
+        append_links({start_url}, queue_file)
 
-    session = build_session()
+    session = build_session(settings.retries, settings.backoff, settings.user_agent)
 
     print(f"\nCrawling : {domain}")
     print(f"Output   : {output_dir}")
@@ -172,30 +182,46 @@ def crawl(
     print(f"Filetypes: {', '.join(sorted(extensions))}")
     print(f"Queue    : {len(queue):,} | Visited: {len(visited):,}\n")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = set()
+    with session, concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}
+        scheduled = set()
+        results = {"downloaded": 0, "skipped": 0, "failed": 0}
         while queue:
             url = queue.pop()
-            if url in visited:
+            if url in visited or url in scheduled:
                 continue
-
-            visited.add(url)
-            append_links({url}, visited_file)
 
             if get_file_extension(url) in extensions:
                 print(f"Queuing download : {url}")
-                future = executor.submit(download_file, session, url, output_dir)
-                futures.add(future)
+                future = executor.submit(
+                    download_file, session, url, output_dir, settings.download_timeout
+                )
+                futures[future] = url
+                scheduled.add(url)
             else:
+                visited.add(url)
+                append_links({url}, visited_file)
                 print(f"Crawling         : {url}")
-                new_links = extract_links(session, url, domain) - visited
+                new_links = extract_links(session, url, domain, settings.page_timeout) - visited
                 if new_links:
                     queue.update(new_links)
                     append_links(new_links, queue_file)
 
-        # Wait for any remaining downloads
-        concurrent.futures.wait(futures)
+        # Only completed downloads enter visited; failures stay in the saved queue.
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results[result] += 1
+            if result != "failed":
+                url = futures[future]
+                visited.add(url)
+                append_links({url}, visited_file)
 
+    print(
+        f"\nSummary: {results['downloaded']} downloaded, "
+        f"{results['skipped']} already present, {results['failed']} failed"
+    )
+    if results["failed"]:
+        print("Failed downloads remain queued. Re-run with the same state files to retry.")
     print(f"\nDone. Files saved to '{output_dir}/'")
 
 
@@ -203,7 +229,17 @@ def crawl(
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_args() -> argparse.Namespace:
+def positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def parse_args(settings: Settings = DEFAULTS) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="docrawler",
         description=(
@@ -215,21 +251,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("url", help="Starting URL (e.g. https://example.com)")
     parser.add_argument(
         "-o", "--output",
-        default=DEFAULT_OUTPUT_DIR,
+        default=settings.output_dir,
         metavar="DIR",
         help="Directory to save downloaded files",
     )
     parser.add_argument(
         "-e", "--extensions",
         nargs="+",
-        default=DEFAULT_EXTENSIONS,
+        default=list(settings.extensions),
         metavar="EXT",
         help="File extensions to download",
     )
     parser.add_argument(
         "-w", "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
+        type=positive_int,
+        default=settings.workers,
         metavar="N",
         help="Number of concurrent download threads",
     )
@@ -241,50 +277,78 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--visited-file",
-        default=DEFAULT_VISITED_FILE,
+        default=settings.visited_file,
         metavar="FILE",
         help="State file tracking visited URLs (enables resume)",
     )
     parser.add_argument(
         "--queue-file",
-        default=DEFAULT_QUEUE_FILE,
+        default=settings.queue_file,
         metavar="FILE",
         help="State file tracking queued URLs (enables resume)",
     )
     parser.add_argument(
         "--log",
-        default=DEFAULT_LOG_FILE,
+        default=settings.log_file,
         metavar="FILE",
         help="Log file path",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        if not is_valid_url(args.url):
+            parser.error("url must be an absolute http:// or https:// URL")
+        if args.domain and (
+            not is_valid_url(f"https://{args.domain}")
+            or urlparse(f"https://{args.domain}").netloc != args.domain
+            or not is_same_domain(args.url, args.domain)
+        ):
+            parser.error("--domain must be a host containing the starting URL")
+        paths = [os.path.normcase(os.path.abspath(p)) for p in (
+            args.visited_file, args.queue_file, args.log
+        )]
+        if len(set(paths)) != len(paths):
+            parser.error("visited, queue, and log files must use different paths")
+    except ValueError as e:
+        parser.error(f"invalid URL or path: {e}")
+    return args
 
 
 def main() -> None:
-    args = parse_args()
-
-    logging.basicConfig(
-        filename=args.log,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    try:
+        settings = load_settings()
+    except ValueError as e:
+        raise SystemExit(f"Configuration error: {e}") from None
+    args = parse_args(settings)
 
     domain = args.domain or get_domain(args.url)
     if not domain:
         print("Error: could not determine domain from URL.")
         raise SystemExit(1)
 
-    extensions = {ext if ext.startswith(".") else f".{ext}" for ext in args.extensions}
+    extensions = {ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in args.extensions}
 
-    crawl(
-        start_url=args.url,
-        domain=domain,
-        output_dir=args.output,
-        extensions=extensions,
-        workers=args.workers,
-        visited_file=args.visited_file,
-        queue_file=args.queue_file,
-    )
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(args.log)), exist_ok=True)
+        logging.basicConfig(
+            filename=args.log,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+        )
+        crawl(
+            start_url=args.url,
+            domain=domain,
+            output_dir=args.output,
+            extensions=extensions,
+            workers=args.workers,
+            visited_file=args.visited_file,
+            queue_file=args.queue_file,
+            settings=settings,
+        )
+    except (OSError, UnicodeError) as e:
+        logging.error("Cannot access crawl files: %s", e)
+        raise SystemExit(f"File error: {e}. Check the configured paths and permissions.") from None
+    except KeyboardInterrupt:
+        raise SystemExit("Crawl interrupted. Re-run with the same state files to resume discovery.") from None
 
 
 if __name__ == "__main__":
